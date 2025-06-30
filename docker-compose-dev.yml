@@ -1,7 +1,7 @@
 version: "3.9"
 services:
-  auth:
-    container_name: auth
+  supabase-auth:
+    container_name: supabase-auth
     depends_on:
       - postgres
     build:

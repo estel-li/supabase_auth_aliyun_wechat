@@ -49,6 +49,10 @@ func GetSmsProvider(config conf.GlobalConfiguration) (SmsProvider, error) {
 		return NewVonageProvider(config.Sms.Vonage)
 	case "twilio_verify":
 		return NewTwilioVerifyProvider(config.Sms.TwilioVerify)
+	case "huawei_cloud":
+		return NewHuaweiCloudProvider(config.Sms.HuaweiCloud)
+	case "aliyun":
+		return NewAliyunProvider(config.Sms.Aliyun)
 	default:
 		return nil, fmt.Errorf("sms Provider %s could not be found", name)
 	}
