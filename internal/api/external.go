@@ -666,7 +666,8 @@ func (a *API) Provider(ctx context.Context, name string, scopes string) (provide
 		pConfig = config.External.Zoom
 		p, err = provider.NewZoomProvider(pConfig)
 	case "wechat":
-		return provider.NewWeChatProvider(config.External.WeChat)
+		pConfig = config.External.WeChat
+		p, err = provider.NewWeChatProvider(pConfig)
 	default:
 		return nil, pConfig, fmt.Errorf("Provider %s could not be found", name)
 	}
