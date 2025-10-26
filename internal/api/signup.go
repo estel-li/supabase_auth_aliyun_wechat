@@ -146,7 +146,7 @@ func (a *API) Signup(w http.ResponseWriter, r *http.Request) error {
 		if err != nil {
 			return err
 		}
-		user, err = models.IsDuplicatedEmail(db, params.Email, params.Aud, nil)
+		user, err = models.IsDuplicatedEmail(db, params.Email, params.Aud, nil, config.Experimental.ProvidersWithOwnLinkingDomain)
 	case "phone":
 		if !config.External.Phone.Enabled {
 			return apierrors.NewBadRequestError(apierrors.ErrorCodePhoneProviderDisabled, "Phone signups are disabled")
@@ -227,7 +227,7 @@ func (a *API) Signup(w http.ResponseWriter, r *http.Request) error {
 
 		if params.Provider == "email" && !user.IsConfirmed() {
 			if config.Mailer.Autoconfirm {
-				if terr = models.NewAuditLogEntry(r, tx, user, models.UserSignedUpAction, "", map[string]interface{}{
+				if terr = models.NewAuditLogEntry(config.AuditLog, r, tx, user, models.UserSignedUpAction, "", map[string]interface{}{
 					"provider": params.Provider,
 				}); terr != nil {
 					return terr
@@ -236,7 +236,7 @@ func (a *API) Signup(w http.ResponseWriter, r *http.Request) error {
 					return apierrors.NewInternalServerError("Database error updating user").WithInternalError(terr)
 				}
 			} else {
-				if terr = models.NewAuditLogEntry(r, tx, user, models.UserConfirmationRequestedAction, "", map[string]interface{}{
+				if terr = models.NewAuditLogEntry(config.AuditLog, r, tx, user, models.UserConfirmationRequestedAction, "", map[string]interface{}{
 					"provider": params.Provider,
 				}); terr != nil {
 					return terr
@@ -253,7 +253,7 @@ func (a *API) Signup(w http.ResponseWriter, r *http.Request) error {
 			}
 		} else if params.Provider == "phone" && !user.IsPhoneConfirmed() {
 			if config.Sms.Autoconfirm {
-				if terr = models.NewAuditLogEntry(r, tx, user, models.UserSignedUpAction, "", map[string]interface{}{
+				if terr = models.NewAuditLogEntry(config.AuditLog, r, tx, user, models.UserSignedUpAction, "", map[string]interface{}{
 					"provider": params.Provider,
 					"channel":  params.Channel,
 				}); terr != nil {
@@ -263,7 +263,7 @@ func (a *API) Signup(w http.ResponseWriter, r *http.Request) error {
 					return apierrors.NewInternalServerError("Database error updating user").WithInternalError(terr)
 				}
 			} else {
-				if terr = models.NewAuditLogEntry(r, tx, user, models.UserConfirmationRequestedAction, "", map[string]interface{}{
+				if terr = models.NewAuditLogEntry(config.AuditLog, r, tx, user, models.UserConfirmationRequestedAction, "", map[string]interface{}{
 					"provider": params.Provider,
 				}); terr != nil {
 					return terr
@@ -280,7 +280,7 @@ func (a *API) Signup(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		if errors.Is(err, UserExistsError) {
 			err = db.Transaction(func(tx *storage.Connection) error {
-				if terr := models.NewAuditLogEntry(r, tx, user, models.UserRepeatedSignUpAction, "", map[string]interface{}{
+				if terr := models.NewAuditLogEntry(config.AuditLog, r, tx, user, models.UserRepeatedSignUpAction, "", map[string]interface{}{
 					"provider": params.Provider,
 				}); terr != nil {
 					return terr
@@ -307,7 +307,7 @@ func (a *API) Signup(w http.ResponseWriter, r *http.Request) error {
 		var token *AccessTokenResponse
 		err = db.Transaction(func(tx *storage.Connection) error {
 			var terr error
-			if terr = models.NewAuditLogEntry(r, tx, user, models.LoginAction, "", map[string]interface{}{
+			if terr = models.NewAuditLogEntry(config.AuditLog, r, tx, user, models.LoginAction, "", map[string]interface{}{
 				"provider": params.Provider,
 			}); terr != nil {
 				return terr
@@ -322,13 +322,24 @@ func (a *API) Signup(w http.ResponseWriter, r *http.Request) error {
 		if err != nil {
 			return err
 		}
-		metering.RecordLogin("password", user.ID)
+		metering.RecordLogin(metering.LoginTypePassword, user.ID, &metering.LoginData{
+			Provider: params.Provider,
+			// add extra context to indicate this is immediate login right after signup
+			Extra: map[string]interface{}{
+				"immediate_login_after_signup": true,
+			},
+		})
 		return sendJSON(w, http.StatusOK, token)
 	}
 	if user.HasBeenInvited() {
 		// Remove sensitive fields
 		user.UserMetaData = map[string]interface{}{}
 		user.Identities = []models.Identity{}
+	}
+
+	// Trigger the after user created hook.
+	if err := a.triggerAfterUserCreated(r, db, user); err != nil {
+		return apierrors.NewInternalServerError("Error invoking hook").WithInternalError(err)
 	}
 	return sendJSON(w, http.StatusOK, user)
 }
@@ -389,6 +400,5 @@ func (a *API) signupNewUser(conn *storage.Connection, user *models.User) (*model
 	if err := conn.Reload(user); err != nil {
 		return nil, apierrors.NewInternalServerError("Database error loading user after sign-up").WithInternalError(err)
 	}
-
 	return user, nil
 }

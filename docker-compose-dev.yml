@@ -1,4 +1,3 @@
-version: "3.9"
 services:
   supabase-auth:
     container_name: supabase-auth
@@ -19,7 +18,6 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.postgres.dev
-    container_name: auth_postgres
     ports:
       - '5432:5432'
     volumes:

@@ -2,15 +2,9 @@ package api
 
 import (
 	"context"
-	"fmt"
 	"net/http"
-	"net/url"
-	"strconv"
-	"time"
 
 	"github.com/gofrs/uuid"
-	"github.com/golang-jwt/jwt/v5"
-	"github.com/xeipuuv/gojsonschema"
 
 	"github.com/supabase/auth/internal/api/apierrors"
 	"github.com/supabase/auth/internal/hooks/v0hooks"
@@ -18,46 +12,12 @@ import (
 	"github.com/supabase/auth/internal/models"
 	"github.com/supabase/auth/internal/observability"
 	"github.com/supabase/auth/internal/storage"
+	"github.com/supabase/auth/internal/tokens"
 )
 
-// AccessTokenClaims is a struct thats used for JWT claims
-type AccessTokenClaims struct {
-	jwt.RegisteredClaims
-	Email                         string                 `json:"email"`
-	Phone                         string                 `json:"phone"`
-	AppMetaData                   map[string]interface{} `json:"app_metadata"`
-	UserMetaData                  map[string]interface{} `json:"user_metadata"`
-	Role                          string                 `json:"role"`
-	AuthenticatorAssuranceLevel   string                 `json:"aal,omitempty"`
-	AuthenticationMethodReference []models.AMREntry      `json:"amr,omitempty"`
-	SessionId                     string                 `json:"session_id,omitempty"`
-	IsAnonymous                   bool                   `json:"is_anonymous"`
-}
-
-// AccessTokenResponse represents an OAuth2 success response
-type AccessTokenResponse struct {
-	Token                string             `json:"access_token"`
-	TokenType            string             `json:"token_type"` // Bearer
-	ExpiresIn            int                `json:"expires_in"`
-	ExpiresAt            int64              `json:"expires_at"`
-	RefreshToken         string             `json:"refresh_token"`
-	User                 *models.User       `json:"user"`
-	ProviderAccessToken  string             `json:"provider_token,omitempty"`
-	ProviderRefreshToken string             `json:"provider_refresh_token,omitempty"`
-	WeakPassword         *WeakPasswordError `json:"weak_password,omitempty"`
-}
-
-// AsRedirectURL encodes the AccessTokenResponse as a redirect URL that
-// includes the access token response data in a URL fragment.
-func (r *AccessTokenResponse) AsRedirectURL(redirectURL string, extraParams url.Values) string {
-	extraParams.Set("access_token", r.Token)
-	extraParams.Set("token_type", r.TokenType)
-	extraParams.Set("expires_in", strconv.Itoa(r.ExpiresIn))
-	extraParams.Set("expires_at", strconv.FormatInt(r.ExpiresAt, 10))
-	extraParams.Set("refresh_token", r.RefreshToken)
-
-	return redirectURL + "#" + extraParams.Encode()
-}
+// Aliases for backward compatibility
+type AccessTokenClaims = tokens.AccessTokenClaims
+type AccessTokenResponse = tokens.AccessTokenResponse
 
 // PasswordGrantParams are the parameters the ResourceOwnerPasswordGrant method accepts
 type PasswordGrantParams struct {
@@ -205,7 +165,7 @@ func (a *API) ResourceOwnerPasswordGrant(ctx context.Context, w http.ResponseWri
 				output.Message = v0hooks.DefaultPasswordHookRejectionMessage
 			}
 			if output.ShouldLogoutUser {
-				if err := models.Logout(a.db, user.ID); err != nil {
+				if err := models.Logout(db, user.ID); err != nil {
 					return err
 				}
 			}
@@ -225,12 +185,12 @@ func (a *API) ResourceOwnerPasswordGrant(ctx context.Context, w http.ResponseWri
 	var token *AccessTokenResponse
 	err = db.Transaction(func(tx *storage.Connection) error {
 		var terr error
-		if terr = models.NewAuditLogEntry(r, tx, user, models.LoginAction, "", map[string]interface{}{
+		if terr = models.NewAuditLogEntry(config.AuditLog, r, tx, user, models.LoginAction, "", map[string]interface{}{
 			"provider": provider,
 		}); terr != nil {
 			return terr
 		}
-		token, terr = a.issueRefreshToken(r, tx, user, models.PasswordGrant, grantParams)
+		token, terr = a.tokenService.IssueRefreshToken(r, tx, user, models.PasswordGrant, grantParams)
 		if terr != nil {
 			return terr
 		}
@@ -243,12 +203,15 @@ func (a *API) ResourceOwnerPasswordGrant(ctx context.Context, w http.ResponseWri
 
 	token.WeakPassword = weakPasswordError
 
-	metering.RecordLogin("password", user.ID)
+	metering.RecordLogin(metering.LoginTypePassword, user.ID, &metering.LoginData{
+		Provider: provider,
+	})
 	return sendJSON(w, http.StatusOK, token)
 }
 
 func (a *API) PKCE(ctx context.Context, w http.ResponseWriter, r *http.Request) error {
 	db := a.db.WithContext(ctx)
+	config := a.config
 	var grantParams models.GrantParams
 
 	// There is a slight problem with this as it will pick-up the
@@ -292,12 +255,12 @@ func (a *API) PKCE(ctx context.Context, w http.ResponseWriter, r *http.Request) 
 		if err != nil {
 			return err
 		}
-		if terr := models.NewAuditLogEntry(r, tx, user, models.LoginAction, "", map[string]interface{}{
+		if terr := models.NewAuditLogEntry(config.AuditLog, r, tx, user, models.LoginAction, "", map[string]interface{}{
 			"provider_type": flowState.ProviderType,
 		}); terr != nil {
 			return terr
 		}
-		token, terr = a.issueRefreshToken(r, tx, user, authMethod, grantParams)
+		token, terr = a.tokenService.IssueRefreshToken(r, tx, user, authMethod, grantParams)
 		if terr != nil {
 			// error type is already handled in issueRefreshToken
 			return terr
@@ -317,122 +280,25 @@ func (a *API) PKCE(ctx context.Context, w http.ResponseWriter, r *http.Request) 
 		return err
 	}
 
+	metering.RecordLogin(metering.LoginTypePKCE, user.ID, &metering.LoginData{
+		Provider: flowState.ProviderType,
+	})
 	return sendJSON(w, http.StatusOK, token)
 }
 
 func (a *API) generateAccessToken(r *http.Request, tx *storage.Connection, user *models.User, sessionId *uuid.UUID, authenticationMethod models.AuthenticationMethod) (string, int64, error) {
-	config := a.config
-	if sessionId == nil {
-		return "", 0, apierrors.NewInternalServerError("Session is required to issue access token")
-	}
-	sid := sessionId.String()
-	session, terr := models.FindSessionByID(tx, *sessionId, false)
-	if terr != nil {
-		return "", 0, terr
-	}
-	aal, amr, terr := session.CalculateAALAndAMR(user)
-	if terr != nil {
-		return "", 0, terr
-	}
-
-	issuedAt := time.Now().UTC()
-	expiresAt := issuedAt.Add(time.Second * time.Duration(config.JWT.Exp))
-
-	claims := &v0hooks.AccessTokenClaims{
-		RegisteredClaims: jwt.RegisteredClaims{
-			Subject:   user.ID.String(),
-			Audience:  jwt.ClaimStrings{user.Aud},
-			IssuedAt:  jwt.NewNumericDate(issuedAt),
-			ExpiresAt: jwt.NewNumericDate(expiresAt),
-			Issuer:    config.JWT.Issuer,
-		},
-		Email:                         user.GetEmail(),
-		Phone:                         user.GetPhone(),
-		AppMetaData:                   user.AppMetaData,
-		UserMetaData:                  user.UserMetaData,
-		Role:                          user.Role,
-		SessionId:                     sid,
-		AuthenticatorAssuranceLevel:   aal.String(),
-		AuthenticationMethodReference: amr,
-		IsAnonymous:                   user.IsAnonymous,
-	}
-
-	var gotrueClaims jwt.Claims = claims
-	if config.Hook.CustomAccessToken.Enabled {
-		input := v0hooks.CustomAccessTokenInput{
-			UserID:               user.ID,
-			Claims:               claims,
-			AuthenticationMethod: authenticationMethod.String(),
-		}
-
-		output := v0hooks.CustomAccessTokenOutput{}
-
-		err := a.hooksMgr.InvokeHook(tx, r, &input, &output)
-		if err != nil {
-			return "", 0, err
-		}
-		if err := validateTokenClaims(output.Claims); err != nil {
-			return "", 0, err
-		}
-		gotrueClaims = jwt.MapClaims(output.Claims)
-	}
-
-	signed, err := signJwt(&config.JWT, gotrueClaims)
-	if err != nil {
-		return "", 0, err
-	}
-	return signed, expiresAt.Unix(), nil
-}
-
-func (a *API) issueRefreshToken(r *http.Request, conn *storage.Connection, user *models.User, authenticationMethod models.AuthenticationMethod, grantParams models.GrantParams) (*AccessTokenResponse, error) {
-	config := a.config
-
-	now := time.Now()
-	user.LastSignInAt = &now
-
-	var tokenString string
-	var expiresAt int64
-	var refreshToken *models.RefreshToken
-
-	err := conn.Transaction(func(tx *storage.Connection) error {
-		var terr error
-
-		refreshToken, terr = models.GrantAuthenticatedUser(tx, user, grantParams)
-		if terr != nil {
-			return apierrors.NewInternalServerError("Database error granting user").WithInternalError(terr)
-		}
-
-		terr = models.AddClaimToSession(tx, *refreshToken.SessionId, authenticationMethod)
-		if terr != nil {
-			return terr
-		}
-
-		tokenString, expiresAt, terr = a.generateAccessToken(r, tx, user, refreshToken.SessionId, authenticationMethod)
-		if terr != nil {
-			// Account for Hook Error
-			httpErr, ok := terr.(*HTTPError)
-			if ok {
-				return httpErr
-			}
-			return apierrors.NewInternalServerError("error generating jwt token").WithInternalError(terr)
-		}
-		return nil
+	return a.tokenService.GenerateAccessToken(r, tx, tokens.GenerateAccessTokenParams{
+		User:                 user,
+		SessionID:            sessionId,
+		AuthenticationMethod: authenticationMethod,
 	})
-	if err != nil {
-		return nil, err
-	}
-
-	return &AccessTokenResponse{
-		Token:        tokenString,
-		TokenType:    "bearer",
-		ExpiresIn:    config.JWT.Exp,
-		ExpiresAt:    expiresAt,
-		RefreshToken: refreshToken.Token,
-		User:         user,
-	}, nil
 }
 
-func (a *API) updateMFASessionAndClaims(r *http.Request, tx *storage.Connection, user *models.User, authenticationMethod models.AuthenticationMethod, grantParams models.GrantParams) (*AccessTokenResponse, error) {
+func (a *API) issueRefreshToken(r *http.Request, conn *storage.Connection, user *models.User, authenticationMethod models.AuthenticationMethod, grantParams models.GrantParams) (*tokens.AccessTokenResponse, error) {
+	return a.tokenService.IssueRefreshToken(r, conn, user, authenticationMethod, grantParams)
+}
+
+func (a *API) updateMFASessionAndClaims(r *http.Request, tx *storage.Connection, user *models.User, authenticationMethod models.AuthenticationMethod, grantParams models.GrantParams) (*tokens.AccessTokenResponse, error) {
 	ctx := r.Context()
 	config := a.config
 	var tokenString string
@@ -460,7 +326,7 @@ func (a *API) updateMFASessionAndClaims(r *http.Request, tx *storage.Connection,
 			return err
 		}
 		// Swap to ensure current token is the latest one
-		refreshToken, terr = models.GrantRefreshTokenSwap(r, tx, user, currentToken)
+		refreshToken, terr = models.GrantRefreshTokenSwap(config.AuditLog, r, tx, user, currentToken)
 		if terr != nil {
 			return terr
 		}
@@ -473,7 +339,12 @@ func (a *API) updateMFASessionAndClaims(r *http.Request, tx *storage.Connection,
 			return err
 		}
 
-		tokenString, expiresAt, terr = a.generateAccessToken(r, tx, user, &session.ID, authenticationMethod)
+		tokenString, expiresAt, terr = a.tokenService.GenerateAccessToken(r, tx, tokens.GenerateAccessTokenParams{
+			User:                 user,
+			SessionID:            &session.ID,
+			AuthenticationMethod: authenticationMethod,
+		})
+
 		if terr != nil {
 			httpErr, ok := terr.(*HTTPError)
 			if ok {
@@ -486,7 +357,7 @@ func (a *API) updateMFASessionAndClaims(r *http.Request, tx *storage.Connection,
 	if err != nil {
 		return nil, err
 	}
-	return &AccessTokenResponse{
+	return &tokens.AccessTokenResponse{
 		Token:        tokenString,
 		TokenType:    "bearer",
 		ExpiresIn:    config.JWT.Exp,
@@ -495,90 +366,3 @@ func (a *API) updateMFASessionAndClaims(r *http.Request, tx *storage.Connection,
 		User:         user,
 	}, nil
 }
-
-var schemaLoader = gojsonschema.NewStringLoader(MinimumViableTokenSchema)
-
-func validateTokenClaims(outputClaims map[string]interface{}) error {
-	documentLoader := gojsonschema.NewGoLoader(outputClaims)
-	result, err := gojsonschema.Validate(schemaLoader, documentLoader)
-	if err != nil {
-		return err
-	}
-
-	if !result.Valid() {
-		var errorMessages string
-
-		for _, desc := range result.Errors() {
-			errorMessages += fmt.Sprintf("- %s\n", desc)
-		}
-		err = fmt.Errorf(
-			"output claims do not conform to the expected schema: \n%s", errorMessages)
-	}
-	if err != nil {
-		httpError := &apierrors.HTTPError{
-			HTTPStatus: http.StatusInternalServerError,
-			Message:    err.Error(),
-		}
-		return httpError
-	}
-	return nil
-}
-
-// #nosec
-const MinimumViableTokenSchema = `{
-  "$schema": "http://json-schema.org/draft-07/schema#",
-  "type": "object",
-  "properties": {
-    "aud": {
-      "type": ["string", "array"]
-    },
-    "exp": {
-      "type": "integer"
-    },
-    "jti": {
-      "type": "string"
-    },
-    "iat": {
-      "type": "integer"
-    },
-    "iss": {
-      "type": "string"
-    },
-    "nbf": {
-      "type": "integer"
-    },
-    "sub": {
-      "type": "string"
-    },
-    "email": {
-      "type": "string"
-    },
-    "phone": {
-      "type": "string"
-    },
-    "app_metadata": {
-      "type": "object",
-      "additionalProperties": true
-    },
-    "user_metadata": {
-      "type": "object",
-      "additionalProperties": true
-    },
-    "role": {
-      "type": "string"
-    },
-    "aal": {
-      "type": "string"
-    },
-    "amr": {
-      "type": "array",
-      "items": {
-        "type": "object"
-      }
-    },
-    "session_id": {
-      "type": "string"
-    }
-  },
-  "required": ["aud", "exp", "iat", "sub", "email", "phone", "role", "aal", "session_id", "is_anonymous"]
-}`

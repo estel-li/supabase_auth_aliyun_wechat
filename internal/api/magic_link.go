@@ -130,13 +130,13 @@ func (a *API) MagicLink(w http.ResponseWriter, r *http.Request) error {
 	}
 
 	if isPKCEFlow(flowType) {
-		if _, err = generateFlowState(a.db, models.MagicLink.String(), models.MagicLink, params.CodeChallengeMethod, params.CodeChallenge, &user.ID); err != nil {
+		if _, err = generateFlowState(db, models.MagicLink.String(), models.MagicLink, params.CodeChallengeMethod, params.CodeChallenge, &user.ID); err != nil {
 			return err
 		}
 	}
 
 	err = db.Transaction(func(tx *storage.Connection) error {
-		if terr := models.NewAuditLogEntry(r, tx, user, models.UserRecoveryRequestedAction, "", nil); terr != nil {
+		if terr := models.NewAuditLogEntry(config.AuditLog, r, tx, user, models.UserRecoveryRequestedAction, "", nil); terr != nil {
 			return terr
 		}
 		return a.sendMagicLink(r, tx, user, flowType)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 
 	"github.com/gofrs/uuid"
@@ -51,7 +52,7 @@ func (a *API) requireAdmin(ctx context.Context) (context.Context, error) {
 
 	adminRoles := a.config.JWT.AdminRoles
 
-	if isStringInSlice(claims.Role, adminRoles) {
+	if slices.Contains(adminRoles, claims.Role) {
 		// successful authentication
 		return withAdminUser(ctx, &models.User{Role: claims.Role, Email: storage.NullString(claims.Role)}), nil
 	}
@@ -63,7 +64,7 @@ func (a *API) extractBearerToken(r *http.Request) (string, error) {
 	authHeader := r.Header.Get("Authorization")
 	matches := bearerRegexp.FindStringSubmatch(authHeader)
 	if len(matches) != 2 {
-		return "", apierrors.NewHTTPError(http.StatusUnauthorized, apierrors.ErrorCodeNoAuthorization, "This endpoint requires a Bearer token")
+		return "", apierrors.NewHTTPError(http.StatusUnauthorized, apierrors.ErrorCodeNoAuthorization, "This endpoint requires a valid Bearer token")
 	}
 
 	return matches[1], nil
@@ -77,7 +78,15 @@ func (a *API) parseJWTClaims(bearer string, r *http.Request) (context.Context, e
 	token, err := p.ParseWithClaims(bearer, &AccessTokenClaims{}, func(token *jwt.Token) (interface{}, error) {
 		if kid, ok := token.Header["kid"]; ok {
 			if kidStr, ok := kid.(string); ok {
-				return conf.FindPublicKeyByKid(kidStr, &config.JWT)
+				key, err := conf.FindPublicKeyByKid(kidStr, &config.JWT)
+				if err != nil {
+					return nil, err
+				}
+				if key != nil {
+					return key, nil
+				}
+
+				// otherwise try to use fallback
 			}
 		}
 		if alg, ok := token.Header["alg"]; ok {
@@ -86,7 +95,8 @@ func (a *API) parseJWTClaims(bearer string, r *http.Request) (context.Context, e
 				return []byte(config.JWT.Secret), nil
 			}
 		}
-		return nil, fmt.Errorf("missing kid")
+
+		return nil, fmt.Errorf("unrecognized JWT kid %v for algorithm %v", token.Header["kid"], token.Header["alg"])
 	})
 	if err != nil {
 		return nil, apierrors.NewForbiddenError(apierrors.ErrorCodeBadJWT, "invalid JWT: unable to parse or verify signature, %v", err).WithInternalError(err)

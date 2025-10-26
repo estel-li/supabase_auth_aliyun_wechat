@@ -14,6 +14,7 @@ import (
 	"github.com/gofrs/uuid"
 	"github.com/supabase/auth/internal/api/apierrors"
 	"github.com/supabase/auth/internal/api/provider"
+	"github.com/supabase/auth/internal/metering"
 	"github.com/supabase/auth/internal/models"
 	"github.com/supabase/auth/internal/observability"
 	"github.com/supabase/auth/internal/storage"
@@ -102,6 +103,12 @@ func (a *API) handleSamlAcs(w http.ResponseWriter, r *http.Request) error {
 			return apierrors.NewInternalServerError("Unable to find SSO Provider from SAML RelayState")
 		}
 
+		if !ssoProvider.IsEnabled() {
+			return apierrors.NewNotFoundError(
+				apierrors.ErrorCodeSSOProviderDisabled,
+				"SSO Provider assigned for this domain is currently disabled")
+		}
+
 		initiatedBy = "sp"
 		entityId = ssoProvider.SAMLProvider.EntityID
 		redirectTo = relayState.RedirectTo
@@ -153,6 +160,12 @@ func (a *API) handleSamlAcs(w http.ResponseWriter, r *http.Request) error {
 		return apierrors.NewNotFoundError(apierrors.ErrorCodeSAMLIdPNotFound, "A SAML connection has not been established with this Identity Provider")
 	} else if err != nil {
 		return err
+	}
+
+	if !ssoProvider.IsEnabled() {
+		return apierrors.NewNotFoundError(
+			apierrors.ErrorCodeSSOProviderDisabled,
+			"SSO Provider assigned for this domain is currently disabled")
 	}
 
 	idpMetadata, err := ssoProvider.SAMLProvider.EntityDescriptor()
@@ -287,14 +300,18 @@ func (a *API) handleSamlAcs(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 
+	var createdUser bool
+	var user *models.User
 	if err := db.Transaction(func(tx *storage.Connection) error {
 		var terr error
-		var user *models.User
 
 		// accounts potentially created via SAML can contain non-unique email addresses in the auth.users table
-		if user, terr = a.createAccountFromExternalIdentity(tx, r, &userProvidedData, providerType); terr != nil {
+		var decision models.AccountLinkingDecision
+		if decision, user, terr = a.createAccountFromExternalIdentity(tx, r, &userProvidedData, providerType, false); terr != nil {
 			return terr
 		}
+		createdUser = decision == models.CreateAccount
+
 		if flowState != nil {
 			// This means that the callback is using PKCE
 			flowState.UserID = &(user.ID)
@@ -313,6 +330,11 @@ func (a *API) handleSamlAcs(w http.ResponseWriter, r *http.Request) error {
 	}); err != nil {
 		return err
 	}
+	if createdUser {
+		if err := a.triggerAfterUserCreated(r, db, user); err != nil {
+			return err
+		}
+	}
 
 	if !utilities.IsRedirectURLValid(config, redirectTo) {
 		redirectTo = config.SiteURL
@@ -328,6 +350,14 @@ func (a *API) handleSamlAcs(w http.ResponseWriter, r *http.Request) error {
 		return nil
 
 	}
+
+	// Record login for analytics - only when token is issued (not during pkce authorize)
+	if token != nil {
+		metering.RecordLogin(metering.LoginTypeSSO, token.User.ID, &metering.LoginData{
+			Provider: metering.ProviderSAML,
+		})
+	}
+
 	http.Redirect(w, r, token.AsRedirectURL(redirectTo, url.Values{}), http.StatusFound)
 
 	return nil

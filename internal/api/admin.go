@@ -304,7 +304,7 @@ func (a *API) adminUserUpdate(w http.ResponseWriter, r *http.Request) error {
 			}
 		}
 
-		if terr := models.NewAuditLogEntry(r, tx, adminUser, models.UserModifiedAction, "", map[string]interface{}{
+		if terr := models.NewAuditLogEntry(config.AuditLog, r, tx, adminUser, models.UserModifiedAction, "", map[string]interface{}{
 			"user_id":    user.ID,
 			"user_email": user.Email,
 			"user_phone": user.Phone,
@@ -348,7 +348,7 @@ func (a *API) adminUserCreate(w http.ResponseWriter, r *http.Request) error {
 		if err != nil {
 			return err
 		}
-		if user, err := models.IsDuplicatedEmail(db, params.Email, aud, nil); err != nil {
+		if user, err := models.IsDuplicatedEmail(db, params.Email, aud, nil, config.Experimental.ProvidersWithOwnLinkingDomain); err != nil {
 			return apierrors.NewInternalServerError("Database error checking email").WithInternalError(err)
 		} else if user != nil {
 			return apierrors.NewUnprocessableEntityError(apierrors.ErrorCodeEmailExists, DuplicateEmailMsg)
@@ -457,7 +457,7 @@ func (a *API) adminUserCreate(w http.ResponseWriter, r *http.Request) error {
 
 		user.Identities = identities
 
-		if terr := models.NewAuditLogEntry(r, tx, adminUser, models.UserSignedUpAction, "", map[string]interface{}{
+		if terr := models.NewAuditLogEntry(config.AuditLog, r, tx, adminUser, models.UserSignedUpAction, "", map[string]interface{}{
 			"user_id":    user.ID,
 			"user_email": user.Email,
 			"user_phone": user.Phone,
@@ -512,7 +512,9 @@ func (a *API) adminUserCreate(w http.ResponseWriter, r *http.Request) error {
 func (a *API) adminUserDelete(w http.ResponseWriter, r *http.Request) error {
 	ctx := r.Context()
 	user := getUser(ctx)
+	config := a.config
 	adminUser := getAdminUser(ctx)
+	db := a.db.WithContext(ctx)
 
 	// ShouldSoftDelete defaults to false
 	params := &adminUserDeleteParams{}
@@ -524,8 +526,8 @@ func (a *API) adminUserDelete(w http.ResponseWriter, r *http.Request) error {
 		}
 	}
 
-	err := a.db.Transaction(func(tx *storage.Connection) error {
-		if terr := models.NewAuditLogEntry(r, tx, adminUser, models.UserDeletedAction, "", map[string]interface{}{
+	err := db.Transaction(func(tx *storage.Connection) error {
+		if terr := models.NewAuditLogEntry(config.AuditLog, r, tx, adminUser, models.UserDeletedAction, "", map[string]interface{}{
 			"user_id":    user.ID,
 			"user_email": user.Email,
 			"user_phone": user.Phone,
@@ -571,11 +573,13 @@ func (a *API) adminUserDelete(w http.ResponseWriter, r *http.Request) error {
 
 func (a *API) adminUserDeleteFactor(w http.ResponseWriter, r *http.Request) error {
 	ctx := r.Context()
+	config := a.config
 	user := getUser(ctx)
 	factor := getFactor(ctx)
+	db := a.db.WithContext(ctx)
 
-	err := a.db.Transaction(func(tx *storage.Connection) error {
-		if terr := models.NewAuditLogEntry(r, tx, user, models.DeleteFactorAction, r.RemoteAddr, map[string]interface{}{
+	err := db.Transaction(func(tx *storage.Connection) error {
+		if terr := models.NewAuditLogEntry(config.AuditLog, r, tx, user, models.DeleteFactorAction, r.RemoteAddr, map[string]interface{}{
 			"user_id":   user.ID,
 			"factor_id": factor.ID,
 		}); terr != nil {
@@ -601,16 +605,18 @@ func (a *API) adminUserGetFactors(w http.ResponseWriter, r *http.Request) error 
 // adminUserUpdate updates a single factor object
 func (a *API) adminUserUpdateFactor(w http.ResponseWriter, r *http.Request) error {
 	ctx := r.Context()
+	config := a.config
 	factor := getFactor(ctx)
 	user := getUser(ctx)
 	adminUser := getAdminUser(ctx)
 	params := &adminUserUpdateFactorParams{}
+	db := a.db.WithContext(ctx)
 
 	if err := retrieveRequestParams(r, params); err != nil {
 		return err
 	}
 
-	err := a.db.Transaction(func(tx *storage.Connection) error {
+	err := db.Transaction(func(tx *storage.Connection) error {
 		if params.FriendlyName != "" {
 			if terr := factor.UpdateFriendlyName(tx, params.FriendlyName); terr != nil {
 				return terr
@@ -627,7 +633,7 @@ func (a *API) adminUserUpdateFactor(w http.ResponseWriter, r *http.Request) erro
 			}
 		}
 
-		if terr := models.NewAuditLogEntry(r, tx, adminUser, models.UpdateFactorAction, "", map[string]interface{}{
+		if terr := models.NewAuditLogEntry(config.AuditLog, r, tx, adminUser, models.UpdateFactorAction, "", map[string]interface{}{
 			"user_id":     user.ID,
 			"factor_id":   factor.ID,
 			"factor_type": factor.FactorType,

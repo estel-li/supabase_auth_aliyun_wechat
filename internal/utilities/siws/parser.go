@@ -1,9 +1,10 @@
 package siws
 
 import (
+	"bytes"
 	"crypto/ed25519"
-	"errors"
-	"fmt"
+	"encoding/binary"
+	"math"
 	"net/url"
 	"regexp"
 	"strings"
@@ -37,23 +38,23 @@ var addressPattern = regexp.MustCompile("^[a-zA-Z0-9]{32,44}$")
 func ParseMessage(raw string) (*SIWSMessage, error) {
 	lines := strings.Split(raw, "\n")
 	if len(lines) < 6 {
-		return nil, errors.New("siws: message needs at least 6 lines")
+		return nil, ErrMessageTooShort
 	}
 
 	// Parse first line exactly
 	header := lines[0]
 	if !strings.HasSuffix(header, headerSuffix) {
-		return nil, fmt.Errorf("siws: message first line does not end in %q", headerSuffix)
+		return nil, ErrInvalidHeader
 	}
 
 	domain := strings.TrimSpace(strings.TrimSuffix(header, headerSuffix))
 	if !IsValidDomain(domain) {
-		return nil, errors.New("siws: domain in first line of message is not valid")
+		return nil, ErrInvalidDomain
 	}
 
 	address := strings.TrimSpace(lines[1])
 	if !addressPattern.MatchString(address) {
-		return nil, errors.New("siws: wallet address is not in base58 format")
+		return nil, ErrInvalidAddress
 	}
 
 	msg := &SIWSMessage{
@@ -63,7 +64,7 @@ func ParseMessage(raw string) (*SIWSMessage, error) {
 	}
 
 	if lines[2] != "" {
-		return nil, errors.New("siws: third line must be empty")
+		return nil, ErrThirdLineNotEmpty
 	}
 
 	startIndex := 3
@@ -77,12 +78,12 @@ func ParseMessage(raw string) (*SIWSMessage, error) {
 		line := strings.TrimSpace(lines[i])
 
 		if inResources {
-			if strings.HasPrefix(line, "- ") {
-				resource := strings.TrimSpace(strings.TrimPrefix(line, "- "))
+			if after, ok := strings.CutPrefix(line, "- "); ok {
+				resource := strings.TrimSpace(after)
 
 				resourceURL, err := url.ParseRequestURI(resource)
 				if err != nil {
-					return nil, fmt.Errorf("siws: Resource at position %d has invalid URI", len(msg.Resources))
+					return nil, errInvalidResource(len(msg.Resources))
 				}
 
 				msg.Resources = append(msg.Resources, resourceURL)
@@ -103,7 +104,7 @@ func ParseMessage(raw string) (*SIWSMessage, error) {
 
 		key, value, found := strings.Cut(line, ":")
 		if !found {
-			return nil, fmt.Errorf("siws: encountered unparsable line at index %d", i)
+			return nil, errUnparsableLine(i)
 		}
 
 		value = strings.TrimSpace(value)
@@ -112,7 +113,7 @@ func ParseMessage(raw string) (*SIWSMessage, error) {
 		case "URI":
 			uri, err := url.ParseRequestURI(value)
 			if err != nil {
-				return nil, errors.New("siws: URI is not valid")
+				return nil, ErrInvalidURI
 			}
 
 			msg.URI = uri
@@ -121,6 +122,9 @@ func ParseMessage(raw string) (*SIWSMessage, error) {
 			msg.Version = value
 
 		case "Chain ID":
+			if value != "" && !IsValidSolanaNetwork(value) {
+				return nil, ErrInvalidChainID
+			}
 			msg.ChainID = value
 
 		case "Nonce":
@@ -131,7 +135,7 @@ func ParseMessage(raw string) (*SIWSMessage, error) {
 			if err != nil {
 				ts, err = time.Parse(time.RFC3339Nano, value)
 				if err != nil {
-					return nil, errors.New("siws: Issued At is not a valid ISO8601 timestamp")
+					return nil, ErrInvalidIssuedAt
 				}
 			}
 			msg.IssuedAt = ts
@@ -141,7 +145,7 @@ func ParseMessage(raw string) (*SIWSMessage, error) {
 			if err != nil {
 				ts, err = time.Parse(time.RFC3339Nano, value)
 				if err != nil {
-					return nil, errors.New("siws: Expiration Time is not a valid ISO8601 timestamp")
+					return nil, ErrInvalidExpirationTime
 				}
 			}
 			msg.ExpirationTime = ts
@@ -151,7 +155,7 @@ func ParseMessage(raw string) (*SIWSMessage, error) {
 			if err != nil {
 				ts, err = time.Parse(time.RFC3339Nano, value)
 				if err != nil {
-					return nil, errors.New("siws: Not Before is not a valid ISO8601 timestamp")
+					return nil, ErrInvalidNotBefore
 				}
 			}
 			msg.NotBefore = ts
@@ -162,30 +166,26 @@ func ParseMessage(raw string) (*SIWSMessage, error) {
 	}
 
 	if msg.Version != "1" {
-		return nil, fmt.Errorf("siws: Version value is not supported, expected 1 got %q", msg.Version)
+		return nil, errUnsupportedVersion(msg.Version)
 	}
 
 	if msg.IssuedAt.IsZero() {
-		return nil, errors.New("siws: Issued At is not specified")
+		return nil, ErrMissingIssuedAt
 	}
 
 	if msg.URI == nil {
-		return nil, errors.New("siws: URI is not specified")
-	}
-
-	if msg.ChainID != "" && !IsValidSolanaNetwork(msg.ChainID) {
-		return nil, errors.New("siws: Chain ID is not valid")
+		return nil, ErrMissingURI
 	}
 
 	if !msg.IssuedAt.IsZero() && !msg.ExpirationTime.IsZero() {
 		if msg.IssuedAt.After(msg.ExpirationTime) {
-			return nil, errors.New("siws: Issued At is after Expiration Time")
+			return nil, ErrIssuedAfterExpiration
 		}
 	}
 
 	if !msg.NotBefore.IsZero() && !msg.ExpirationTime.IsZero() {
 		if msg.NotBefore.After(msg.ExpirationTime) {
-			return nil, errors.New("siws: Not Before is after Expiration Time")
+			return nil, ErrNotBeforeAfterExpiration
 		}
 	}
 
@@ -194,6 +194,46 @@ func ParseMessage(raw string) (*SIWSMessage, error) {
 
 func (m *SIWSMessage) VerifySignature(signature []byte) bool {
 	pubKey := base58.Decode(m.Address)
+	raw := []byte(m.Raw)
 
-	return ed25519.Verify(pubKey, []byte(m.Raw), signature)
+	// try to verify just the signed message (in accordance with https://github.com/phantom/sign-in-with-solana
+	if ed25519.Verify(pubKey, raw, signature) {
+		return true
+	}
+
+	// if that didn't work, try to verify the signed message as if it was signed via Ledger (https://docs.anza.xyz/proposals/off-chain-message-signing)
+	var buffer bytes.Buffer
+
+	// Write 16-byte prefix
+	buffer.WriteByte(0xff)
+	buffer.WriteString("solana offchain")
+
+	// Write single-byte fields
+	buffer.WriteByte(0x00) // version
+
+	// Write domain, padded/truncated to 32 bytes
+	domain := make([]byte, 32)
+	copy(domain, m.Domain)
+	buffer.Write(domain)
+
+	buffer.WriteByte(0x00) // message format = ascii
+	buffer.WriteByte(0x01) // signer num = 1
+
+	// Write pubkey
+	buffer.Write(pubKey)
+
+	// Write message length (2 bytes, little endian)
+	var rawMsgLen = len(raw)
+	if rawMsgLen > math.MaxUint16 {
+		return false
+	}
+
+	if err := binary.Write(&buffer, binary.LittleEndian, uint16(rawMsgLen)); err != nil {
+		return false
+	}
+
+	// Write message
+	buffer.Write(raw)
+
+	return ed25519.Verify(pubKey, buffer.Bytes(), signature)
 }
